@@ -2,25 +2,42 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const { createClient } = require("@supabase/supabase-js");
-const paypal = require("@paypal/checkout-server-sdk");
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+// ── Supabase via fetch direct (évite les bugs du SDK) ────────
+const SUPABASE_URL = process.env.SUPABASE_URL?.trim().replace(/\/$/, "");
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY?.trim();
 
-const paypalEnv = process.env.NODE_ENV === "production"
-  ? new paypal.core.LiveEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_SECRET)
-  : new paypal.core.SandboxEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_SECRET);
-const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
+async function db(method, table, body = null, filters = "") {
+  const url = `${SUPABASE_URL}/rest/v1/${table}${filters}`;
+  const headers = {
+    "Content-Type": "application/json",
+    "apikey": SUPABASE_KEY,
+    "Authorization": `Bearer ${SUPABASE_KEY}`,
+    "Prefer": method === "POST" ? "return=representation" : "",
+  };
+  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : null });
+  const text = await res.text();
+  try { return { data: JSON.parse(text), status: res.status }; }
+  catch { return { data: text, status: res.status }; }
+}
 
-// Ads hardcodées (pas besoin de table ads dans Supabase)
+// Test route
+app.get("/health", (req, res) => res.json({ ok: true, supabase: SUPABASE_URL }));
+
+// JWT middleware
+function auth(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "Token manquant" });
+  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: "Token invalide" }); }
+}
+
+// Ads intégrées
 const ADS = {
   "1": { id:"1", brand:"Nike", reward:0.15 },
   "2": { id:"2", brand:"Spotify", reward:0.10 },
@@ -30,17 +47,6 @@ const ADS = {
   "6": { id:"6", brand:"Adidas", reward:0.18 },
 };
 
-function auth(req, res, next) {
-  const token = req.headers.authorization?.split(" ")[1];
-  if (!token) return res.status(401).json({ error: "Token manquant" });
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ error: "Token invalide" });
-  }
-}
-
 // POST /auth/register
 app.post("/auth/register", async (req, res) => {
   try {
@@ -48,27 +54,21 @@ app.post("/auth/register", async (req, res) => {
     if (!email || !password || !name)
       return res.status(400).json({ error: "Champs manquants" });
 
-    // Vérifier si l'email existe déjà
-    const { data: existing } = await supabase
-      .from("users").select("id").eq("email", email).single();
-    if (existing)
+    // Vérifier email existant
+    const check = await db("GET", "users", null, `?email=eq.${encodeURIComponent(email)}&select=id`);
+    if (check.data?.length > 0)
       return res.status(400).json({ error: "Email déjà utilisé" });
 
     const hash = await bcrypt.hash(password, 10);
-    const { data, error } = await supabase
-      .from("users")
-      .insert({ email, password_hash: hash, name, balance: 0 })
-      .select().single();
+    const insert = await db("POST", "users", { email, password_hash: hash, name, balance: 0 });
 
-    if (error) {
-      console.error("Insert error:", error);
-      return res.status(400).json({ error: error.message });
-    }
+    if (insert.status !== 201)
+      return res.status(400).json({ error: "Erreur création: " + JSON.stringify(insert.data) });
 
-    const token = jwt.sign({ id: data.id, email }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: data.id, name: data.name, email, balance: 0 } });
+    const user = Array.isArray(insert.data) ? insert.data[0] : insert.data;
+    const token = jwt.sign({ id: user.id, email }, process.env.JWT_SECRET, { expiresIn: "30d" });
+    res.json({ token, user: { id: user.id, name: user.name, email, balance: 0 } });
   } catch(e) {
-    console.error("Register exception:", e);
     res.status(500).json({ error: e.message });
   }
 });
@@ -77,8 +77,8 @@ app.post("/auth/register", async (req, res) => {
 app.post("/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    const { data: user } = await supabase
-      .from("users").select("*").eq("email", email).single();
+    const result = await db("GET", "users", null, `?email=eq.${encodeURIComponent(email)}`);
+    const user = result.data?.[0];
 
     if (!user || !(await bcrypt.compare(password, user.password_hash)))
       return res.status(401).json({ error: "Email ou mot de passe incorrect" });
@@ -92,39 +92,41 @@ app.post("/auth/login", async (req, res) => {
 
 // GET /me
 app.get("/me", auth, async (req, res) => {
-  const { data } = await supabase
-    .from("users").select("id, name, email, balance, created_at")
-    .eq("id", req.user.id).single();
-  res.json(data);
+  try {
+    const result = await db("GET", "users", null, `?id=eq.${req.user.id}&select=id,name,email,balance,created_at`);
+    res.json(result.data?.[0] || {});
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // GET /me/history
 app.get("/me/history", auth, async (req, res) => {
-  const { data } = await supabase
-    .from("ad_views").select("id, ad_id, reward, created_at")
-    .eq("user_id", req.user.id)
-    .order("created_at", { ascending: false }).limit(50);
-  res.json(data || []);
+  try {
+    const result = await db("GET", "ad_views", null, `?user_id=eq.${req.user.id}&order=created_at.desc&limit=50`);
+    res.json(result.data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /ads/:id/complete
 app.post("/ads/:id/complete", auth, async (req, res) => {
   try {
-    const adId = req.params.id;
-    const userId = req.user.id;
-    const ad = ADS[adId];
+    const ad = ADS[req.params.id];
     if (!ad) return res.status(404).json({ error: "Pub introuvable" });
 
-    await supabase.from("ad_views").insert({ user_id: userId, ad_id: adId, reward: ad.reward });
+    const userId = req.user.id;
+    await db("POST", "ad_views", { user_id: userId, ad_id: ad.id, reward: ad.reward });
 
-    const { data: user } = await supabase.from("users").select("balance").eq("id", userId).single();
-    const newBalance = +((user?.balance || 0) + ad.reward).toFixed(2);
-    await supabase.from("users").update({ balance: newBalance }).eq("id", userId);
+    const userResult = await db("GET", "users", null, `?id=eq.${userId}&select=balance`);
+    const currentBalance = userResult.data?.[0]?.balance || 0;
+    const newBalance = +((currentBalance) + ad.reward).toFixed(2);
+
+    await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${userId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}` },
+      body: JSON.stringify({ balance: newBalance })
+    });
 
     res.json({ success: true, reward: ad.reward, new_balance: newBalance });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // POST /withdraw
@@ -132,29 +134,22 @@ app.post("/withdraw", auth, async (req, res) => {
   try {
     const { paypal_email } = req.body;
     const userId = req.user.id;
-    const { data: user } = await supabase.from("users").select("balance, name").eq("id", userId).single();
+    const userResult = await db("GET", "users", null, `?id=eq.${userId}&select=balance,name`);
+    const user = userResult.data?.[0];
 
     if (!user || user.balance < 5)
       return res.status(400).json({ error: "Minimum 5€ requis" });
 
-    const request = new paypal.payouts.PayoutsPostRequest();
-    request.requestBody({
-      sender_batch_header: { sender_batch_id: `WE-${userId}-${Date.now()}`, email_subject: "Votre retrait WatchEarn 💰" },
-      items: [{ recipient_type: "EMAIL", amount: { value: user.balance.toFixed(2), currency: "EUR" }, receiver: paypal_email }],
+    await db("POST", "withdrawals", { user_id: userId, amount: user.balance, paypal_email, status: "pending" });
+    await fetch(`${SUPABASE_URL}/rest/v1/users?id=eq.${userId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}` },
+      body: JSON.stringify({ balance: 0 })
     });
 
-    const response = await paypalClient.execute(request);
-    const batchId = response.result.batch_header.payout_batch_id;
-
-    await supabase.from("withdrawals").insert({ user_id: userId, amount: user.balance, paypal_email, paypal_batch_id: batchId, status: "pending" });
-    await supabase.from("users").update({ balance: 0 }).eq("id", userId);
-
-    res.json({ success: true, batch_id: batchId, amount: user.balance });
-  } catch(err) {
-    console.error("PayPal error:", err);
-    res.status(500).json({ error: "Erreur PayPal: " + err.message });
-  }
+    res.json({ success: true, amount: user.balance });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`✅ WatchEarn API démarrée sur http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`✅ WatchEarn API sur port ${PORT} — Supabase: ${SUPABASE_URL}`));
