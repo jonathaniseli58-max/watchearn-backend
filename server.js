@@ -1,192 +1,258 @@
+// ============================================================
+//  WatchEarn — Backend Node.js
+//  Stack : Express + Supabase + PayPal SDK
+// ============================================================
+
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const { createClient } = require("@supabase/supabase-js");
+const paypal = require("@paypal/checkout-server-sdk");
 require("dotenv").config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const SUPABASE_URL = process.env.SUPABASE_URL?.trim().replace(/\/$/, "");
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY?.trim();
+// ── Supabase ────────────────────────────────────────────────
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-async function db(method, table, body, filters) {
-  filters = filters || "";
-  const url = `${SUPABASE_URL}/rest/v1/${table}${filters}`;
-  const headers = {
-    "Content-Type": "application/json",
-    "apikey": SUPABASE_KEY,
-    "Authorization": `Bearer ${SUPABASE_KEY}`,
-    "Prefer": method === "POST" ? "return=representation" : "return=representation",
-  };
-  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : null });
-  const text = await res.text();
-  try { return { data: JSON.parse(text), status: res.status }; }
-  catch { return { data: text, status: res.status }; }
-}
+// ── PayPal ──────────────────────────────────────────────────
+const paypalEnv = process.env.NODE_ENV === "production"
+  ? new paypal.core.LiveEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_SECRET)
+  : new paypal.core.SandboxEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_SECRET);
+const paypalClient = new paypal.core.PayPalHttpClient(paypalEnv);
 
-async function dbPatch(table, body, filters) {
-  const url = `${SUPABASE_URL}/rest/v1/${table}${filters}`;
-  const headers = {
-    "Content-Type": "application/json",
-    "apikey": SUPABASE_KEY,
-    "Authorization": `Bearer ${SUPABASE_KEY}`,
-    "Prefer": "return=representation",
-  };
-  const res = await fetch(url, { method: "PATCH", headers, body: JSON.stringify(body) });
-  const text = await res.text();
-  try { return { data: JSON.parse(text), status: res.status }; }
-  catch { return { data: text, status: res.status }; }
-}
-
-// Ads intégrées — 0.80€ par cycle
-const ADS = {
-  "1": { id:"1", brand:"Nike", reward:0.13 },
-  "2": { id:"2", brand:"Spotify", reward:0.08 },
-  "3": { id:"3", brand:"Amazon", reward:0.18 },
-  "4": { id:"4", brand:"Netflix", reward:0.10 },
-  "5": { id:"5", brand:"Apple", reward:0.23 },
-  "6": { id:"6", brand:"Adidas", reward:0.08 },
-};
-
-app.get("/health", (req, res) => res.json({ ok: true, supabase: SUPABASE_URL }));
-
+// ── JWT middleware ───────────────────────────────────────────
 function auth(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "Token manquant" });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ error: "Token invalide" }); }
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Token invalide" });
+  }
 }
+
+// ── Anti-fraude : limite de pubs par jour ───────────────────
+const MAX_ADS_PER_DAY = 20;
+
+async function checkDailyLimit(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const { count } = await supabase
+    .from("ad_views")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .gte("created_at", `${today}T00:00:00`);
+  return count < MAX_ADS_PER_DAY;
+}
+
+// ============================================================
+//  AUTH
+// ============================================================
 
 // POST /auth/register
 app.post("/auth/register", async (req, res) => {
-  try {
-    const { email, password, name } = req.body;
-    if (!email || !password || !name)
-      return res.status(400).json({ error: "Champs manquants" });
+  const { email, password, name } = req.body;
+  if (!email || !password || !name)
+    return res.status(400).json({ error: "Champs manquants" });
 
-    const check = await db("GET", "users", null, `?email=eq.${encodeURIComponent(email)}&select=id`);
-    if (check.data?.length > 0)
-      return res.status(400).json({ error: "Email déjà utilisé" });
+  const hash = await bcrypt.hash(password, 10);
 
-    const hash = await bcrypt.hash(password, 10);
-    const insert = await db("POST", "users", {
-      email, password_hash: hash, name,
-      balance: 0, total_views: 0, total_earned: 0
-    });
+  const { data, error } = await supabase
+    .from("users")
+    .insert({ email, password_hash: hash, name, balance: 0 })
+    .select()
+    .single();
 
-    if (insert.status !== 201)
-      return res.status(400).json({ error: "Erreur création: " + JSON.stringify(insert.data) });
+  if (error) return res.status(400).json({ error: "Email déjà utilisé" });
 
-    const user = Array.isArray(insert.data) ? insert.data[0] : insert.data;
-    const token = jwt.sign({ id: user.id, email }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: { id: user.id, name: user.name, email, balance: 0, total_views: 0, total_earned: 0 } });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  const token = jwt.sign({ id: data.id, email }, process.env.JWT_SECRET, { expiresIn: "30d" });
+  res.json({ token, user: { id: data.id, name: data.name, email, balance: 0 } });
 });
 
 // POST /auth/login
 app.post("/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const result = await db("GET", "users", null, `?email=eq.${encodeURIComponent(email)}`);
-    const user = result.data?.[0];
+  const { email, password } = req.body;
 
-    if (!user || !(await bcrypt.compare(password, user.password_hash)))
-      return res.status(401).json({ error: "Email ou mot de passe incorrect" });
+  const { data: user } = await supabase
+    .from("users")
+    .select("*")
+    .eq("email", email)
+    .single();
 
-    const token = jwt.sign({ id: user.id, email }, process.env.JWT_SECRET, { expiresIn: "30d" });
-    res.json({ token, user: {
-      id: user.id, name: user.name, email,
-      balance: user.balance || 0,
-      total_views: user.total_views || 0,
-      total_earned: user.total_earned || 0
-    }});
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  if (!user || !(await bcrypt.compare(password, user.password_hash)))
+    return res.status(401).json({ error: "Email ou mot de passe incorrect" });
+
+  const token = jwt.sign({ id: user.id, email }, process.env.JWT_SECRET, { expiresIn: "30d" });
+  res.json({ token, user: { id: user.id, name: user.name, email, balance: user.balance } });
 });
 
-// GET /me
+// ============================================================
+//  UTILISATEUR
+// ============================================================
+
+// GET /me — profil + solde
 app.get("/me", auth, async (req, res) => {
-  try {
-    const result = await db("GET", "users", null, `?id=eq.${req.user.id}&select=id,name,email,balance,total_views,total_earned,created_at`);
-    res.json(result.data?.[0] || {});
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  const { data } = await supabase
+    .from("users")
+    .select("id, name, email, balance, created_at")
+    .eq("id", req.user.id)
+    .single();
+  res.json(data);
 });
 
-// GET /me/history
+// GET /me/history — historique des gains
 app.get("/me/history", auth, async (req, res) => {
-  try {
-    const result = await db("GET", "ad_views", null, `?user_id=eq.${req.user.id}&order=created_at.desc&limit=50`);
-    res.json(result.data || []);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  const { data } = await supabase
+    .from("ad_views")
+    .select("id, ad_id, reward, created_at")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false })
+    .limit(50);
+  res.json(data);
 });
 
-// POST /ads/:id/complete
+// ============================================================
+//  PUBLICITÉS
+// ============================================================
+
+// GET /ads — liste des pubs disponibles
+app.get("/ads", auth, async (req, res) => {
+  const canWatch = await checkDailyLimit(req.user.id);
+  const { data: ads } = await supabase.from("ads").select("*").eq("active", true);
+  res.json({ ads, can_watch_more: canWatch, max_per_day: MAX_ADS_PER_DAY });
+});
+
+// POST /ads/:id/complete — pub regardée → vérification S2S + crédit
+// En production : Google AdMob envoie un callback S2S signé
+// Ici on simule la vérification côté serveur
 app.post("/ads/:id/complete", auth, async (req, res) => {
-  try {
-    const ad = ADS[req.params.id];
-    if (!ad) return res.status(404).json({ error: "Pub introuvable" });
+  const adId = req.params.id;
+  const userId = req.user.id;
 
-    const userId = req.user.id;
+  // 1. Vérification limite quotidienne
+  const canWatch = await checkDailyLimit(userId);
+  if (!canWatch)
+    return res.status(429).json({ error: "Limite quotidienne atteinte (20 pubs/jour)" });
 
-    // Récupérer le solde et stats actuels
-    const userResult = await db("GET", "users", null, `?id=eq.${userId}&select=balance,total_views,total_earned`);
-    const currentUser = userResult.data?.[0];
-    const currentBalance = currentUser?.balance || 0;
-    const currentViews = currentUser?.total_views || 0;
-    const currentEarned = currentUser?.total_earned || 0;
+  // 2. Vérifier que la pub existe
+  const { data: ad } = await supabase.from("ads").select("*").eq("id", adId).single();
+  if (!ad) return res.status(404).json({ error: "Pub introuvable" });
 
-    const newBalance = +(currentBalance + ad.reward).toFixed(2);
-    const newViews = currentViews + 1;
-    const newEarned = +(currentEarned + ad.reward).toFixed(2);
+  // 3. Enregistrer la vue
+  await supabase.from("ad_views").insert({
+    user_id: userId,
+    ad_id: adId,
+    reward: ad.reward,
+  });
 
-    // Enregistrer la vue
-    await db("POST", "ad_views", { user_id: userId, ad_id: ad.id, reward: ad.reward });
+  // 4. Créditer le solde
+  const { data: updated } = await supabase.rpc("increment_balance", {
+    user_id: userId,
+    amount: ad.reward,
+  });
 
-    // Mettre à jour balance + stats cumulatives
-    await dbPatch("users", {
-      balance: newBalance,
-      total_views: newViews,
-      total_earned: newEarned
-    }, `?id=eq.${userId}`);
-
-    res.json({ success: true, reward: ad.reward, new_balance: newBalance, total_views: newViews, total_earned: newEarned });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  res.json({ success: true, reward: ad.reward, new_balance: updated });
 });
 
-// POST /withdraw — délai 48h, minimum 10€
+// ============================================================
+//  RETRAITS PAYPAL
+// ============================================================
+
+const WITHDRAWAL_MIN = 5.0;
+
+// POST /withdraw
 app.post("/withdraw", auth, async (req, res) => {
+  const { paypal_email } = req.body;
+  const userId = req.user.id;
+
+  // 1. Lire le solde
+  const { data: user } = await supabase
+    .from("users")
+    .select("balance, name")
+    .eq("id", userId)
+    .single();
+
+  if (user.balance < WITHDRAWAL_MIN)
+    return res.status(400).json({ error: `Minimum ${WITHDRAWAL_MIN}€ requis` });
+
+  // 2. Créer le payout PayPal
+  const request = new paypal.payouts.PayoutsPostRequest();
+  request.requestBody({
+    sender_batch_header: {
+      sender_batch_id: `WE-${userId}-${Date.now()}`,
+      email_subject: "Votre retrait WatchEarn 💰",
+    },
+    items: [{
+      recipient_type: "EMAIL",
+      amount: { value: user.balance.toFixed(2), currency: "EUR" },
+      receiver: paypal_email,
+      note: `Retrait WatchEarn pour ${user.name}`,
+    }],
+  });
+
   try {
-    const { paypal_email } = req.body;
-    const userId = req.user.id;
-    const userResult = await db("GET", "users", null, `?id=eq.${userId}&select=balance,name`);
-    const user = userResult.data?.[0];
+    const response = await paypalClient.execute(request);
+    const batchId = response.result.batch_header.payout_batch_id;
 
-    if (!user || user.balance < 10)
-      return res.status(400).json({ error: "Minimum 10€ requis" });
-
-    // Enregistrer le retrait avec statut pending
-    await db("POST", "withdrawals", {
+    // 3. Enregistrer le retrait
+    await supabase.from("withdrawals").insert({
       user_id: userId,
       amount: user.balance,
       paypal_email,
-      status: "pending"
+      paypal_batch_id: batchId,
+      status: "pending",
     });
 
-    // Remettre le solde à 0 (total_earned reste intact)
-    await dbPatch("users", { balance: 0 }, `?id=eq.${userId}`);
+    // 4. Remettre le solde à zéro
+    await supabase.from("users").update({ balance: 0 }).eq("id", userId);
 
-    res.json({ success: true, amount: user.balance, message: "Virement sous 48h ouvrées" });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
+    res.json({ success: true, batch_id: batchId, amount: user.balance });
+  } catch (err) {
+    console.error("PayPal error:", err);
+    res.status(500).json({ error: "Erreur PayPal, réessayez plus tard" });
   }
 });
 
+// GET /withdraw/history
+app.get("/withdraw/history", auth, async (req, res) => {
+  const { data } = await supabase
+    .from("withdrawals")
+    .select("*")
+    .eq("user_id", req.user.id)
+    .order("created_at", { ascending: false });
+  res.json(data);
+});
+
+// ============================================================
+//  ADMOB CALLBACK S2S (en production)
+// ============================================================
+// Google AdMob appelle cette route après chaque pub récompensée
+// avec une signature HMAC à vérifier
+app.get("/admob/callback", async (req, res) => {
+  const { ad_network, ad_unit, custom_data, reward_amount, reward_item,
+          timestamp, transaction_id, user_id, signature, key_id } = req.query;
+
+  // TODO en production : vérifier la signature HMAC avec votre clé AdMob
+  // https://developers.google.com/admob/android/ssv
+
+  console.log("AdMob S2S callback:", { user_id, reward_amount, transaction_id });
+
+  // Créditer l'utilisateur
+  await supabase.rpc("increment_balance", {
+    user_id,
+    amount: parseFloat(reward_amount) * 0.01, // Convertir les points en euros
+  });
+
+  res.status(200).send("OK");
+});
+
+// ── Lancement ────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`✅ WatchEarn API sur port ${PORT} — Supabase: ${SUPABASE_URL}`));
+app.listen(PORT, () => console.log(`✅ WatchEarn API démarrée sur http://localhost:${PORT}`));
