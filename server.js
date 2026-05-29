@@ -187,6 +187,8 @@ app.post("/withdraw", auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
+app.get("/show-ad", (req, res) => {
+  res.send(`<!DOCTYPE html><html><head><title>action=show_ad</title></head><body></body></html>`);
+});
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`✅ WatchEarn API sur port ${PORT} — Supabase: ${SUPABASE_URL}`));
