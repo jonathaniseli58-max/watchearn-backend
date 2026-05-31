@@ -133,7 +133,6 @@ app.post("/ads/:id/complete", auth, async (req, res) => {
 
     const userId = req.user.id;
 
-    // Récupérer le solde et stats actuels
     const userResult = await db("GET", "users", null, `?id=eq.${userId}&select=balance,total_views,total_earned`);
     const currentUser = userResult.data?.[0];
     const currentBalance = currentUser?.balance || 0;
@@ -144,10 +143,8 @@ app.post("/ads/:id/complete", auth, async (req, res) => {
     const newViews = currentViews + 1;
     const newEarned = +(currentEarned + ad.reward).toFixed(2);
 
-    // Enregistrer la vue
     await db("POST", "ad_views", { user_id: userId, ad_id: ad.id, reward: ad.reward });
 
-    // Mettre à jour balance + stats cumulatives
     await dbPatch("users", {
       balance: newBalance,
       total_views: newViews,
@@ -171,7 +168,6 @@ app.post("/withdraw", auth, async (req, res) => {
     if (!user || user.balance < 10)
       return res.status(400).json({ error: "Minimum 10€ requis" });
 
-    // Enregistrer le retrait avec statut pending
     await db("POST", "withdrawals", {
       user_id: userId,
       amount: user.balance,
@@ -179,7 +175,6 @@ app.post("/withdraw", auth, async (req, res) => {
       status: "pending"
     });
 
-    // Remettre le solde à 0 (total_earned reste intact)
     await dbPatch("users", { balance: 0 }, `?id=eq.${userId}`);
 
     res.json({ success: true, amount: user.balance, message: "Virement sous 48h ouvrées" });
@@ -187,8 +182,18 @@ app.post("/withdraw", auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ✅ Route signal AdMob — redirige vers le site après 1s
 app.get("/show-ad", (req, res) => {
-  res.send(`<!DOCTYPE html><html><head><title>action=show_ad</title></head><body></body></html>`);
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <title>action=show_ad</title>
+  <meta http-equiv="refresh" content="1;url=https://jonathaniseli58-max.github.io/watchearn-frontend/">
+</head>
+<body></body>
+</html>`);
 });
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`✅ WatchEarn API sur port ${PORT} — Supabase: ${SUPABASE_URL}`));
