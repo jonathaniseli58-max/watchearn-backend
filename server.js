@@ -183,16 +183,9 @@ app.post("/withdraw", auth, async (req, res) => {
   }
 });
 
-// ✅ Route signal AdMob — redirige vers le site après 1s
+// ✅ Route signal AdMob — page simple sans redirection
 app.get("/show-ad", (req, res) => {
-  res.send(`<!DOCTYPE html>
-<html>
-<head>
-  <title>action=show_ad</title>
-  <meta http-equiv="refresh" content="1;url=https://jonathaniseli58-max.github.io/watchearn-frontend/">
-</head>
-<body></body>
-</html>`);
+  res.send(`<!DOCTYPE html><html><head><title>action=show_ad</title></head><body></body></html>`);
 });
 
 const PORT = process.env.PORT || 3001;
